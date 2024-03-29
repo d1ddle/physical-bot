@@ -1,0 +1,385 @@
+from datetime import datetime, timedelta
+from sr.robot3 import *
+import math, time, sys
+
+## !! IMPORTANT !!                          #For Hz robot EACH WHEEL HAS 22.7cm CIRCUMFERENCE#
+#DEFINE CONSTANTS HERE
+MIN_DIST = 0.4                              #minimum distance a sensor should consider a collision.
+COLLISIONOFFSET = 0.6                       #collision offset for arms when holding box moving towards marker target (spaceship)
+
+#We have 5 types of object.
+BOUNDARY = -1
+ASTEROID = -2
+EGG = -3
+SPACESHIP = -4
+MYSPACESHIP = -5
+
+MARKER_FOV_THRESHOLD = 0.03
+TURNCONSTANT = 0.0155
+TURNSPEED = 0.1 
+SCAN_ANGLE = 50                 #previously 35
+SENSOR_ERROR_THRESHOLD = 3
+#Arena boundary	                0 - 27	
+#Asteroid marker	        150-199	
+#Egg Marker	                110	
+#Spaceship Port Marker	        120-123	
+#Spaceship Starboard Marker	125-128	
+
+class MyRobot(Robot):
+    
+    def __init__(self):                     #Initialise Robot class
+        super().__init__()
+        self.status = "class initialised"
+        self.forwardSpeed = 0.3
+        self.mySpaceShip = 120 + self.zone
+        self.log(("My Spaceship is ",self.mySpaceShip))
+        self.front_sensor_errors = 0        #used to test if sensor values change or not and whether warning should be raised
+        self.clearCollision()               #assume starting position of robot is not in a collision state.    
+        self.marker_target = ""             #current target - Asteroid, Spaceship or EGG!.
+        self.getSensors()                   #gets initial sensor readings for sensor checking.
+        self.sensorIncrement()              #gets previous sensor distances for sensor checking
+        self.update()                       #gets next sensor and initial marker readings.
+        self.visited_markers = []           #array of asteroids collected.
+        self.stop_motors = False            #permit robot to move.
+        self.undocking = False              #whether robot is trying to move away from spaceship
+    
+    #Gripper Functions
+    def gripperMove(self,value):            #worker function for gripper
+        self.servo_board.servos[0].position = value
+        self.servo_board.servos[1].position = value
+        #self.log(("gripper moved to position",value))
+        self.restInterupt(0.5)
+        self.servo_board.servos[0].position = None
+        self.servo_board.servos[1].position = None
+        self.restInterupt(0.5)
+        self.servo_board.servos[1].position = None
+    def gripperOpen(self):                  # open gripper fully
+        self.gripperMove(-1)
+        self.log("gripper fully open")
+    def gripperDump(self):                  # dump asteroid in spaceship
+        self.stopRobot()
+        self.log("gripper dump")
+        self.moveArm(1)                     # arm up
+        self.restInterupt(1)                # rests for 1 second
+        self.startRobot()                   # starts the robot
+        self.moveRobot(0.3, 20)             # move forward 0.3 speed, 20 second; collisions will kill
+        self.gripperOpen()                  # pray
+        self.undocking = True
+        self.clearCollision()
+        self.startRobot()
+        self.clearCollision()
+        self.moveRobot(-0.3, 1)           # move away from spaceship after drop
+        self.visited_markers.append(self.marker_target) #mark box as territory
+        self.marker_target = ""
+        self.undocking = False
+        self.startRobot()
+        self.rotateRobot(-90)
+        self.moveArm(-1)
+    def gripperClose(self):                 # close gripper fully
+        self.gripperMove(1)
+        self.log("gripper fully closed")
+
+    def calculateSpeed(self, distance):
+        if distance > 2.5:
+            self.log("Speed set to 1 WARP factor 9")
+            self.forwardSpeed = 0.8
+        elif distance > 1 and distance < 2.5:
+            self.log("Speed set to WARP factor 1")
+            self.forwardSpeed = 0.5
+        else:
+            self.log("Speed set to full Impulse...")
+            self.forwardSpeed = 0.3
+    #Arm Functions
+    def moveArm(self, decimal):             #move the arm up/down on % 
+        # inputs between 0 and 1, 0 = down, 1 = up
+        self.log(("Raising arm ",decimal))
+        self.servo_board.servos[2].position = decimal
+        self.restInterupt(0.1)
+
+    def isBoundary(self, marker_id):
+        if marker_id >= 0 and marker_id <= 27:
+            return True
+        else:
+            return False
+
+    #Wait, Utility & Interupt functions.
+    def getTarget(self, targettype):
+        #updates the class.marker_target to the closest marker of desired type 
+        #BOUNDARY = 0 #ASTEROID = 1 #EGG = 2 #SPACESHIP = 3
+        self.calculateSpeed(self.front_sensor_distance)      #forward fast!
+        
+        result = False
+        self.marker_target = ""
+        for temp_marker in self.markers: #find closed marker of desired type
+            if not temp_marker in self.visited_markers:
+                if targettype >= 0 and temp_marker.id == targettype:    #reused targettype as explicit index
+                    result = True                                       #by making object types negative
+                    self.marker_target = temp_marker    #find specific marker_id
+                    break
+                elif targettype == MYSPACESHIP and temp_marker.id == self.mySpaceShip:
+                    result = True
+                    self.marker_target = temp_marker    #we found our spaceship
+                    self.log("Found mySpaceShip")
+                    break
+                elif targettype == SPACESHIP and temp_marker.id >= 120 and temp_marker.id <= 123:
+                    result = True
+                    self.marker_target = temp_marker    #we found a spaceship
+                    break
+                elif targettype == ASTEROID and temp_marker.id >= 150 and temp_marker.id <=199:
+                    result = True
+                    self.marker_target = temp_marker    #we found asteroid
+                    break
+                elif targettype == EGG and temp_marker.id == 110: 
+                    result = True
+                    self.marker_target = temp_marker    #we found egg!!!!!!!
+                    break
+                elif targettype == BOUNDARY and temp_marker.id >= 0 and temp_marker.id <= 27:
+                    result = True
+                    self.marker_target = temp_marker
+                    break
+                else:
+                    self.log(("Target ", targettype, " not equal to temp_marker.id ", temp_marker.id))
+                
+        if result == True:
+            self.log(("Found target from camera ",temp_marker.id))
+        else:
+            self.log(("NOT found from camera where TARGETTYPE Value = ",targettype))
+        
+        return result #(self.marker_target != "")
+    
+    def restInterupt(self, sleep):
+        # do stuff in here to check for errors.
+        self.log(("Sleep:restInterupt (seconds) ",sleep))
+        #real robot code
+        #self.log(("Motor 0 Current",self.motor_board.motors[0].current))
+        #self.log(("Motor 1 Current",self.motor_board.motors[1].current))
+        self.sleep(sleep)
+        self.calculateSpeed(self.front_sensor_distance)      #forward fast!
+    
+    def clearCollision(self):               #reset collision detection settings
+        self.front_collision = False
+        self.back_collision = False
+        self.rear_collision = False
+        self.right_collision = False
+        self.left_collision = False
+        self.gripper_collision_left = False
+        self.gripper_collision_right = False
+        self.log("Collisions cleared.")
+        
+    def frontCollision(self):
+        return (self.front_collision or self.gripper_collision_left or self.gripper_collision_right)
+    
+    def updateMarkers(self):
+        self.markers = self.camera.see()    #ensure we take scene to evaluate next nearest asteroid, spaceship or egg!
+        self.log("Markers updated.")
+        self.restInterupt(0.1)
+
+    def sensorIncrement(self): #called by sensorCheck to rotate previous sensor value
+        self.previous_front_sensor_distance = self.front_sensor_distance
+
+    def sensorCheck(self):
+        if self.front_sensor_distance == self.previous_front_sensor_distance:
+            self.front_sensor_errors += 1
+            self.log("Front sensor hasn't changed; error logged")
+        else:
+            self.front_sensor_errors = 0                # resets error counter so is only triggered by 3 consecutive same readings
+
+        if self.front_sensor_errors > SENSOR_ERROR_THRESHOLD:
+            self.log("Front sensor hasn't changed in 4+ scans; halting.")
+            self.stopRobot()
+
+        self.sensorIncrement()
+
+    def getSensors(self): #separates sensor sampling from update call
+        self.gripper_sensor_left_distance = round(self.arduino.pins[A0].analog_read(),2)
+        self.gripper_sensor_right_distance = round(self.arduino.pins[A1].analog_read(),2)
+        self.front_sensor_distance = round(self.arduino.pins[A4].analog_read(),2)
+        self.back_sensor_distance = round(self.arduino.pins[A5].analog_read(),2)
+        self.right_sensor_distance = round(self.arduino.pins[A3].analog_read(),2)
+        self.left_sensor_distance = round(self.arduino.pins[A2].analog_read(),2)
+    
+    def update(self):
+        #gather sensor data from Ultrasound
+        #if the robot is NOT moving AND the ARM is down then we can call 'see' and get a new scene. 
+        #Hz robot will need these remapped due to different Ultrasound sensor array.
+        #Ultra Sound Sensors for simulated robot as below.
+        #A0 Front Left INPUT
+        #A1 Front Right INPUT
+        #A2 Left INPUT
+        #A3 Right INPUT
+        #A4 Front INPUT
+        #A5 Back INPUT
+
+        collision_offset = 0
+        if self.marker_target != "":
+            if self.marker_target.id == self.mySpaceShip or self.isBoundary(self.marker_target.id):
+                collision_offset = COLLISIONOFFSET
+            if self.servo_board.servos[2].position == 1:
+                collision_offset = -0.2
+            if self.undocking == True:
+                collision_offset = -0.3
+        print("COLLISIONS: ", MIN_DIST + collision_offset)
+        
+        self.getSensors()
+        
+        #detect here if a sensor has less than MIN_DIST, set class variable accordingly.
+        if self.gripper_sensor_left_distance <= MIN_DIST + collision_offset:
+            self.gripper_collision_left = True
+        if self.gripper_sensor_right_distance <= MIN_DIST + collision_offset:
+            self.gripper_collision_right = True
+        if self.front_sensor_distance <= MIN_DIST + collision_offset:
+            self.front_collision = True
+        if self.back_sensor_distance <= MIN_DIST + collision_offset:
+            self.back_collision = True
+        if self.right_sensor_distance <= MIN_DIST + collision_offset:
+            self.right_collision = True
+        if self.left_sensor_distance  <= MIN_DIST + collision_offset:
+            self.left_collision = True
+            
+        if self.front_collision or self.gripper_collision_left or self.gripper_collision_right: 
+            self.log(("Front Collision detected.", "F:", self.front_collision, "L:", self.gripper_collision_left, "R:", self.gripper_collision_right))
+            self.stopRobot()
+        if self.back_collision:
+            self.log("Back Collision detected.")
+        if self.left_collision:
+            self.log("Left Collision detected.")
+        if self.right_collision:
+            self.log("Right Collision detected.")
+            
+        if self.motor_board.motors[0].power == 0 and self.motor_board.motors[1].power == 0:
+            self.restInterupt(0.1)
+            self.updateMarkers()
+            self.log(("Updated Sensors, Camera active, Measure", self.front_sensor_distance, self.gripper_sensor_right_distance, self.gripper_sensor_left_distance))
+        else:
+            self.log(("Updated Sensors, Camera Inactive, Measure", self.front_sensor_distance, self.back_sensor_distance, self.markers[0].position.distance/1000))
+        self.sensorCheck()              #do sensor check to see if they're on the blink
+        self.restInterupt(0.1)          #use restInterupt to complete awaiting actions like a sensorCheck. this will be done with an event queue
+        
+    def delay(self, angle):
+        ## determines relationship between angle of turn and duration needed at 0.1 power
+        time = abs(((angle*100)/6.429)/1000)
+        self.log(("TIME: ", time))
+        if time > 0:
+            self.restInterupt(time)
+            self.motor_board.motors[0].power = 0
+            self.motor_board.motors[1].power = 0
+            self.log(("Slept for", time))
+
+    def log(self,message):                  #log info to debug console
+        now = datetime.now()                #current date and time
+        date_time = now.strftime("%m%d%Y %H:%M:%S")
+        print(date_time,"|",message)	
+        
+    #Robot mobility functions    
+    def stopRobot(self):                    #used to force robot to cease movement from wheels.          
+        #if not self.ignore_collisions:
+        self.stop_motors = True
+        self.motor_board.motors[0].power = 0
+        self.motor_board.motors[1].power = 0
+        #else:
+            #self.log("Collisons ignored.")
+
+    def startRobot(self):
+        self.stop_motors = False
+    
+    def rotateRobot(self, angle):
+        if not self.stop_motors:
+            # Accept positive or negative angle in degrees
+            # 1.395 @ 0.3 = 90 degrees
+            # 5.58 @ 0.3 = 360 degrees
+            # 1 degree = 0.0155
+            # speed = distance / time
+            # to turn 1 degree angle will be 1
+            # so the delay is 0.0155
+            # delay is angle * 0.0155
+            delay = abs(angle) * TURNCONSTANT
+            #TURNCONSTANT = 0.0155
+            #TURNSPEED = 0.1
+            if angle < 0:                       #left
+                self.log(("Rotate Left", angle))
+                self.motor_board.motors[0].power = -TURNSPEED
+                self.motor_board.motors[1].power = TURNSPEED
+            elif angle > 0:                     #right
+                self.log(("Rotate Right", angle))
+                self.motor_board.motors[0].power = TURNSPEED
+                self.motor_board.motors[1].power = -TURNSPEED
+            else:
+                print("Angle is zero, wyd?")
+            robot.restInterupt(delay)
+            self.motor_board.motors[0].power = 0
+            self.motor_board.motors[1].power = 0
+        else:
+            self.log("rotateRobot failed; stop_motors is True")
+
+    def moveRobot(self, speed, duration):   #Move at specified speed and for duration
+        if not self.stop_motors:
+            starttime = datetime.now()      #current date and time
+            endtime = starttime + timedelta(seconds=duration)
+            now_time = datetime.now()
+            while now_time < endtime and not robot.frontCollision():
+                self.log(("moveRobot speed:", speed," duration ", duration))
+                self.motor_board.motors[0].power = speed
+                self.motor_board.motors[1].power = speed
+                self.update()
+                now_time = datetime.now()
+            self.log("Stop Moving")
+            self.stopRobot()
+        else:
+            self.log("moveRobot failed; stop_motors is True")
+
+
+robot = MyRobot()
+done = False
+
+def findObject(Object):
+    #delay = 0.1
+    robot.stopRobot()
+    robot.update()
+    robot.clearCollision()              # clearCollision must come after update so findObject(2) doesn't fail
+    if robot.getTarget(Object):
+        while not robot.frontCollision():
+            # case 1: box is in front (any orientation, but position = 0)
+            if abs(robot.marker_target.position.horizontal_angle) < MARKER_FOV_THRESHOLD: # do until robot is aligned # and front_sensor < (3/4 * d)
+                robot.startRobot()
+                robot.moveRobot(robot.forwardSpeed, 20)        #keep moving forward until collision, so don't stopRobot
+            # case 2: box is not directly infront
+            else:  
+                robot.update()
+                robot.getTarget(Object)
+                #print(robot.marker_target)
+                #print(robot.marker_target.position.horizontal_angle)
+                robot.startRobot()
+                robot.rotateRobot(57.3*robot.marker_target.position.horizontal_angle) #rotateRobot expects degrees, so radians *57.3 = degrees
+                robot.stopRobot()
+                #delay = delay/1.1
+            robot.stopRobot()
+            #robot.update() #measure distance, we need to ensure markers scanned
+        if robot.frontCollision():
+            print("findObject(", Object, ") aborted, frontCollision is True")
+        return True
+    else:
+        robot.startRobot()
+        robot.rotateRobot(-SCAN_ANGLE)
+        robot.stopRobot()
+        robot.update()
+        return findObject(Object)
+
+done = False
+
+while not done:
+    findObject(ASTEROID)
+    robot.gripperClose()
+    robot.moveArm(-0.4)
+    robot.clearCollision()
+    findObject(2)                   #We've decided to look for ID 2. Its a border marker near out spaceship.
+    robot.clearCollision()
+    findObject(MYSPACESHIP)
+    robot.clearCollision()
+    robot.gripperDump()
+    #if len(robot.visited_markers) == 5: # stop after 5 boxes dropped into spaceship
+        #done = True
+
+    print("\n\nNEW LOOP\n\n")
+
+
+print("\n\n\n")
